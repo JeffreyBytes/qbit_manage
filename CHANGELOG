@@ -1,9 +1,8 @@
-# Requirements Updated
-- qbitorrent-api updated to 2023.9.53
-- GitPython updated to 3.1.35
+# New Updates
+- Adds support for environment variables in config file using (`!ENV VAR_NAME`)
+- Add Retries on ConnectionError (#740)
+- Fixes #702
+- Removes warning when `remote_dir` is not defined
 
-# Bug Fixes
-- Fixes [#377](https://github.com/StuffAnThings/qbit_manage/issues/377)
-
-
-**Full Changelog**: https://github.com/StuffAnThings/qbit_manage/compare/v4.0.3...v4.0.4
+Special thanks to @NooNameR for their contributions!
+**Full Changelog**: https://github.com/StuffAnThings/qbit_manage/compare/v4.1.16...v4.1.17

@@ -1,14 +1,18 @@
-""" Utility functions for qBit Manage. """
+"""Utility functions for qBit Manage."""
+
 import json
 import logging
 import os
 import shutil
 import signal
 import time
+from fnmatch import fnmatch
 from pathlib import Path
 
 import requests
 import ruamel.yaml
+from pytimeparse2 import parse
+from ruamel.yaml.constructor import ConstructorError
 
 logger = logging.getLogger("qBit Manage")
 
@@ -37,13 +41,25 @@ def get_list(data, lower=False, split=True, int_list=False):
 def is_tag_in_torrent(check_tag, torrent_tags, exact=True):
     """Check if tag is in torrent_tags"""
     tags = get_list(torrent_tags)
-    if exact:
-        return check_tag in tags
-    else:
-        for t in tags:
-            if check_tag in t:
-                return t
-    return False
+    if isinstance(check_tag, str):
+        if exact:
+            return check_tag in tags
+        else:
+            tags_to_remove = []
+            for tag in tags:
+                if check_tag in tag:
+                    tags_to_remove.append(tag)
+            return tags_to_remove
+    elif isinstance(check_tag, list):
+        if exact:
+            return all(tag in tags for tag in check_tag)
+        else:
+            tags_to_remove = []
+            for tag in tags:
+                for ctag in check_tag:
+                    if ctag in tag:
+                        tags_to_remove.append(tag)
+            return tags_to_remove
 
 
 class TorrentMessages:
@@ -60,17 +76,42 @@ class TorrentMessages:
         "RETITLED",
         "TRUNCATED",
         "TORRENT IS NOT AUTHORIZED FOR USE ON THIS TRACKER",
+        "INFOHASH NOT FOUND.",  # blutopia
+        "TORRENT HAS BEEN DELETED.",  # blutopia
+        "TRACKER NICHT REGISTRIERT.",
+        "TORRENT EXISTIERT NICHT",
+        "TORRENT NICHT GEFUNDEN",
+    ]
+
+    UNREGISTERED_MSGS_BHD = [
+        "DEAD",
+        "DUPE",
+        "COMPLETE SEASON UPLOADED",
+        "COMPLETE SEASON UPLOADED:",
+        "PROBLEM WITH DESCRIPTION",
+        "PROBLEM WITH FILE",
+        "PROBLEM WITH PACK",
+        "SPECIFICALLY BANNED",
+        "TRUMPED",
+        "OTHER",
+        "TORRENT HAS BEEN DELETED",
+        "NUKED",
+        "SEASON PACK:",
+        "SEASON PACK OUT",
+        "SEASON PACK UPLOADED",
     ]
 
     IGNORE_MSGS = [
         "YOU HAVE REACHED THE CLIENT LIMIT FOR THIS TORRENT",
-        "MISSING PASSKEY",
+        "PASSKEY",  # Any mention of passkeys should be a clear sign it should NOT be deleted
         "MISSING INFO_HASH",
-        "PASSKEY IS INVALID",
-        "INVALID PASSKEY",
         "EXPECTED VALUE (LIST, DICT, INT OR STRING) IN BENCODED STRING",
         "COULD NOT PARSE BENCODED DATA",
         "STREAM TRUNCATED",
+        "GATEWAY TIMEOUT",  # BHD Gateway Timeout
+        "ANNOUNCE IS CURRENTLY UNAVAILABLE",  # BHD Announce unavailable
+        "TORRENT HAS BEEN POSTPONED",  # BHD Status
+        "520 (UNKNOWN HTTP ERROR)",
     ]
 
     EXCEPTIONS_MSGS = [
@@ -273,13 +314,27 @@ class check:
         elif var_type == "float":
             try:
                 data[attribute] = float(data[attribute])
-            except:
+            except Exception:
                 pass
             if isinstance(data[attribute], float) and data[attribute] >= min_int:
                 return data[attribute]
             else:
                 message = f"{text} must a float >= {float(min_int)}"
                 throw = True
+        elif var_type == "time_parse":
+            if isinstance(data[attribute], int) and data[attribute] >= min_int:
+                return data[attribute]
+            else:
+                try:
+                    parsed_seconds = parse(data[attribute])
+                    if parsed_seconds is not None:
+                        return int(parsed_seconds / 60)
+                    else:
+                        message = f"Unable to parse {text}, must be a valid time format."
+                        throw = True
+                except Exception:
+                    message = f"Unable to parse {text}, must be a valid time format."
+                    throw = True
         elif var_type == "path":
             if os.path.exists(os.path.abspath(data[attribute])):
                 return os.path.join(data[attribute], "")
@@ -348,7 +403,18 @@ class Failed(Exception):
 
 
 def list_in_text(text, search_list, match_all=False):
-    """Check if a list of strings is in a string"""
+    """
+    Check if elements from a search list are present in a given text.
+
+    Args:
+        text (str): The text to search in.
+        search_list (list or set): The list of elements to search for in the text.
+        match_all (bool, optional): If True, all elements in the search list must be present in the text.
+                                    If False, at least one element must be present. Defaults to False.
+
+    Returns:
+        bool: True if the search list elements are found in the text, False otherwise.
+    """
     if isinstance(search_list, list):
         search_list = set(search_list)
     contains = {x for x in search_list if " " in x}
@@ -405,6 +471,18 @@ def move_files(src, dest, mod=False):
     return to_delete
 
 
+def delete_files(file_path):
+    """Try to delete the file directly."""
+    try:
+        os.remove(file_path)
+    except FileNotFoundError as e:
+        logger.warning(f"File not found: {e.filename} - {e.strerror}.")
+    except PermissionError as e:
+        logger.warning(f"Permission denied: {e.filename} - {e.strerror}.")
+    except OSError as e:
+        logger.error(f"Error deleting file: {e.filename} - {e.strerror}.")
+
+
 def copy_files(src, dest):
     """Copy files from source to destination"""
     dest_path = os.path.dirname(dest)
@@ -417,25 +495,46 @@ def copy_files(src, dest):
         logger.error(ex)
 
 
-def remove_empty_directories(pathlib_root_dir, pattern):
-    """Remove empty directories recursively."""
+def remove_empty_directories(pathlib_root_dir, excluded_paths=None, exclude_patterns=[]):
+    """Remove empty directories recursively, optimized version."""
     pathlib_root_dir = Path(pathlib_root_dir)
-    try:
-        # list all directories recursively and sort them by path,
-        # longest first
-        longest = sorted(
-            pathlib_root_dir.glob(pattern),
-            key=lambda p: len(str(p)),
-            reverse=True,
-        )
-        longest.append(pathlib_root_dir)  # delete the folder itself if it's empty
-        for pdir in longest:
-            try:
-                pdir.rmdir()  # remove directory if empty
-            except (FileNotFoundError, OSError):
-                continue  # catch and continue if non-empty, folders within could already be deleted if run in parallel
-    except FileNotFoundError:
-        pass  # if this is being run in parallel, pathlib_root_dir could already be deleted
+    if excluded_paths is not None:
+        # Ensure excluded_paths is a set of Path objects for efficient lookup
+        excluded_paths = {Path(p) for p in excluded_paths}
+
+    for root, dirs, files in os.walk(pathlib_root_dir, topdown=False):
+        root_path = Path(root)
+        # Skip excluded paths
+        if excluded_paths and root_path in excluded_paths:
+            continue
+
+        exclude_pattern_match = False
+        for exclude_pattern in exclude_patterns:
+            if fnmatch(os.path.join(root, ""), exclude_pattern):
+                exclude_pattern_match = True
+                break
+        if exclude_pattern_match:
+            continue
+
+        # Attempt to remove the directory if it's empty
+        try:
+            os.rmdir(root)
+        except PermissionError as perm:
+            logger.warning(f"{perm} : Unable to delete folder {root} as it has permission issues. Skipping...")
+            pass
+        except OSError:
+            # Directory not empty or other error - safe to ignore here
+            pass
+
+    # Attempt to remove the root directory if it's now empty and not excluded
+    if not excluded_paths or pathlib_root_dir not in excluded_paths:
+        try:
+            pathlib_root_dir.rmdir()
+        except PermissionError as perm:
+            logger.warning(f"{perm} :  Unable to delete folder {root} as it has permission issues. Skipping...")
+            pass
+        except OSError:
+            pass
 
 
 class CheckHardLinks:
@@ -443,33 +542,43 @@ class CheckHardLinks:
     Class to check for hardlinks
     """
 
-    def __init__(self, root_dir, remote_dir):
-        self.root_dir = root_dir
-        self.remote_dir = remote_dir
-        self.root_files = set(get_root_files(self.root_dir, self.remote_dir))
+    def __init__(self, config):
+        self.root_dir = config.root_dir
+        self.remote_dir = config.remote_dir
+        self.orphaned_dir = config.orphaned_dir if config.orphaned_dir else ""
+        self.recycle_dir = config.recycle_dir if config.recycle_dir else ""
+        self.root_files = set(
+            get_root_files(self.root_dir, self.remote_dir)
+            + get_root_files(self.orphaned_dir, "")
+            + get_root_files(self.recycle_dir, "")
+        )
         self.get_inode_count()
 
     def get_inode_count(self):
         self.inode_count = {}
         for file in self.root_files:
-            try:
-                inode_no = os.stat(file.replace(self.root_dir, self.remote_dir)).st_ino
-            except PermissionError as perm:
-                logger.warning(f"{perm} : file {file} has permission issues. Skipping...")
+            # Only check hardlinks for files that are symlinks
+            if os.path.isfile(file) and os.path.islink(file):
                 continue
-            except FileNotFoundError as file_not_found_error:
-                logger.warning(f"{file_not_found_error} : File {file} not found. Skipping...")
-                continue
-            except Exception as ex:
-                logger.stacktrace()
-                logger.error(ex)
-                continue
-            if inode_no in self.inode_count:
-                self.inode_count[inode_no] += 1
             else:
-                self.inode_count[inode_no] = 1
+                try:
+                    inode_no = os.stat(file.replace(self.root_dir, self.remote_dir)).st_ino
+                except PermissionError as perm:
+                    logger.warning(f"{perm} : file {file} has permission issues. Skipping...")
+                    continue
+                except FileNotFoundError as file_not_found_error:
+                    logger.warning(f"{file_not_found_error} : File {file} not found. Skipping...")
+                    continue
+                except Exception as ex:
+                    logger.stacktrace()
+                    logger.error(ex)
+                    continue
+                if inode_no in self.inode_count:
+                    self.inode_count[inode_no] += 1
+                else:
+                    self.inode_count[inode_no] = 1
 
-    def nohardlink(self, file, notify):
+    def nohardlink(self, file, notify, ignore_root_dir):
         """
         Check if there are any hard links
         Will check if there are any hard links if it passes a file or folder
@@ -477,6 +586,23 @@ class CheckHardLinks:
         of the remaining files where the file is greater size a percentage of the largest file
         This fixes the bug in #192
         """
+
+        def has_hardlinks(self, file, ignore_root_dir):
+            """
+            Check if a file has hard links.
+
+            Args:
+                file (str): The path to the file.
+                ignore_root_dir (bool): Whether to ignore the root directory.
+
+            Returns:
+                bool: True if the file has hard links, False otherwise.
+            """
+            if ignore_root_dir:
+                return os.stat(file).st_nlink - self.inode_count.get(os.stat(file).st_ino, 1) > 0
+            else:
+                return os.stat(file).st_nlink > 1
+
         check_for_hl = True
         try:
             if os.path.isfile(file):
@@ -487,14 +613,16 @@ class CheckHardLinks:
                 logger.trace(f"Checking file inum: {os.stat(file).st_ino}")
                 logger.trace(f"Checking no of hard links: {os.stat(file).st_nlink}")
                 logger.trace(f"Checking inode_count dict: {self.inode_count.get(os.stat(file).st_ino)}")
+                logger.trace(f"ignore_root_dir: {ignore_root_dir}")
                 # https://github.com/StuffAnThings/qbit_manage/issues/291 for more details
-                if os.stat(file).st_nlink - self.inode_count.get(os.stat(file).st_ino, 1) > 0:
+                if has_hardlinks(self, file, ignore_root_dir):
+                    logger.trace(f"Hardlinks found in {file}.")
                     check_for_hl = False
             else:
                 sorted_files = sorted(Path(file).rglob("*"), key=lambda x: os.stat(x).st_size, reverse=True)
                 logger.trace(f"Folder: {file}")
                 logger.trace(f"Files Sorted by size: {sorted_files}")
-                threshold = 0.5
+                threshold = 0.1
                 if not sorted_files:
                     msg = (
                         f"Nohardlink Error: Unable to open the folder {file}. "
@@ -517,9 +645,9 @@ class CheckHardLinks:
                         logger.trace(f"Checking file size: {file_size}")
                         logger.trace(f"Checking no of hard links: {file_no_hardlinks}")
                         logger.trace(f"Checking inode_count dict: {self.inode_count.get(os.stat(files).st_ino)}")
-                        if file_no_hardlinks - self.inode_count.get(os.stat(files).st_ino, 1) > 0 and file_size >= (
-                            largest_file_size * threshold
-                        ):
+                        logger.trace(f"ignore_root_dir: {ignore_root_dir}")
+                        if has_hardlinks(self, files, ignore_root_dir) and file_size >= (largest_file_size * threshold):
+                            logger.trace(f"Hardlinks found in {files}.")
                             check_for_hl = False
         except PermissionError as perm:
             logger.warning(f"{perm} : file {file} has permission issues. Skipping...")
@@ -536,6 +664,8 @@ class CheckHardLinks:
 
 def get_root_files(root_dir, remote_dir, exclude_dir=None):
     local_exclude_dir = exclude_dir.replace(remote_dir, root_dir) if exclude_dir and remote_dir != root_dir else exclude_dir
+    # if not root_dir:
+    #     return []
     root_files = [
         os.path.join(path.replace(remote_dir, root_dir) if remote_dir != root_dir else path, name)
         for path, subdirs, files in os.walk(remote_dir if remote_dir != root_dir else root_dir)
@@ -547,7 +677,7 @@ def get_root_files(root_dir, remote_dir, exclude_dir=None):
 
 def load_json(file):
     """Load json file if exists"""
-    if os.path.isfile(file):
+    if os.path.isfile(truncate_filename(file)):
         file = open(file)
         data = json.load(file)
         file.close()
@@ -556,10 +686,48 @@ def load_json(file):
     return data
 
 
+def truncate_filename(filename, max_length=255, offset=0):
+    """
+    Truncate filename if necessary.
+
+    Args:
+        filename (str): The original filename.
+        max_length (int, optional): The maximum length of the truncated filename. Defaults to 255.
+        offset (int, optional): The number of characters to keep from the end of the base name. Defaults to 0.
+
+    Returns:
+        str: The truncated filename.
+
+    """
+    base, ext = os.path.splitext(filename)
+    if len(filename) > max_length:
+        max_base_length = max_length - len(ext) - offset
+        truncated_base = base[:max_base_length]
+        truncated_base_offset = base[-offset:] if offset > 0 else ""
+        truncated_filename = f"{truncated_base}{truncated_base_offset}{ext}"
+    else:
+        truncated_filename = filename
+    return truncated_filename
+
+
 def save_json(torrent_json, dest):
-    """Save json file to destination"""
-    with open(dest, "w", encoding="utf-8") as file:
-        json.dump(torrent_json, file, ensure_ascii=False, indent=4)
+    """Save json file to destination, truncating filename if necessary."""
+    max_filename_length = 255  # Typical maximum filename length on many filesystems
+    directory, filename = os.path.split(dest)
+    filename, ext = os.path.splitext(filename)
+
+    if len(filename) > (max_filename_length - len(ext)):
+        truncated_filename = truncate_filename(filename, max_filename_length)
+        dest = os.path.join(directory, truncated_filename)
+        logger.warning(f"Filename too long, truncated to: {dest}")
+
+    try:
+        with open(dest, "w", encoding="utf-8") as file:
+            json.dump(torrent_json, file, ensure_ascii=False, indent=4)
+    except FileNotFoundError as e:
+        logger.error(f"Failed to save JSON file: {e.filename} - {e.strerror}.")
+    except OSError as e:
+        logger.error(f"OS error occurred: {e.filename} - {e.strerror}.")
 
 
 class GracefulKiller:
@@ -589,13 +757,19 @@ def human_readable_size(size, decimal_places=3):
 
 
 class YAML:
-    """Class to load and save yaml files"""
+    """Class to load and save yaml files with !ENV tag preservation and environment variable resolution"""
 
     def __init__(self, path=None, input_data=None, check_empty=False, create=False):
         self.path = path
         self.input_data = input_data
         self.yaml = ruamel.yaml.YAML()
         self.yaml.indent(mapping=2, sequence=2)
+
+        # Add constructor for !ENV tag
+        self.yaml.Constructor.add_constructor("!ENV", self._env_constructor)
+        # Add representer for !ENV tag
+        self.yaml.Representer.add_representer(EnvStr, self._env_representer)
+
         try:
             if input_data:
                 self.data = self.yaml.load(input_data)
@@ -617,8 +791,36 @@ class YAML:
                 raise Failed("YAML Error: File is empty")
             self.data = {}
 
+    def _env_constructor(self, loader, node):
+        """Constructor for !ENV tag"""
+        value = loader.construct_scalar(node)
+        # Resolve the environment variable at runtime
+        env_value = os.getenv(value)
+        if env_value is None:
+            raise ConstructorError(f"Environment variable '{value}' not found")
+        # Return a custom string subclass that preserves the !ENV tag
+        return EnvStr(value, env_value)
+
+    def _env_representer(self, dumper, data):
+        """Representer for EnvStr class"""
+        return dumper.represent_scalar("!ENV", data.env_var)
+
     def save(self):
-        """Save yaml file"""
+        """Save yaml file with !ENV tags preserved"""
         if self.path:
-            with open(self.path, "w") as filepath:
+            with open(self.path, "w", encoding="utf-8") as filepath:
                 self.yaml.dump(self.data, filepath)
+
+
+class EnvStr(str):
+    """Custom string subclass to preserve !ENV tags"""
+
+    def __new__(cls, env_var, resolved_value):
+        # Create a new string instance with the resolved value
+        instance = super().__new__(cls, resolved_value)
+        instance.env_var = env_var  # Store the environment variable name
+        return instance
+
+    def __repr__(self):
+        """Return the resolved value as a string"""
+        return super().__repr__()
